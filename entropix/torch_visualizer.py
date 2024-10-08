@@ -8,6 +8,16 @@ from entropix.torch_weights import XfmrWeights, LayerWeights, load_weights
 from entropix.torch_sampler import sample, calculate_metrics
 from entropix.prompts import prompt, bp1
 
+METRIC_RANGES = {
+    "logits_entropy": (0.0, 10.0),
+    "logits_varentropy": (0.0, 18.0),
+    "attn_entropy": (11.1, 12.0),
+    "attn_varentropy": (0.0, 2.0),  # This is always zero for me, so, no idea on a decent range
+    "agreement": (8.9e-07, 4.75e-05),
+    "interaction_strength": (0.05, 3.25),
+    "token_probability": (1.0e-12, 0.001),
+}
+
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Device selection, tree is like first apple silicion, then cuda, fallback is cpu.
@@ -84,6 +94,17 @@ def build_attn_mask(seqlen: int, start_pos: int) -> torch.Tensor:
   return mask
 
 
+def normalize_color(color, color_metric):
+    min_val, max_val = METRIC_RANGES[color_metric]
+    return max(0.0, min((color - min_val) / (max_val - min_val), 1.0))
+
+
+def round_to_nearest_05(value):
+    scaled_value = value * 100
+    rounded_scaled_value = round(scaled_value / 5) * 5
+    return rounded_scaled_value / 100
+
+
 def generate(tokens, color_metric):
     cur_pos = 0
     tokens = torch.tensor([tokens], dtype=torch.long).to(device)
@@ -111,31 +132,35 @@ def generate(tokens, color_metric):
         logits, kvcache, scores, stats = xfmr(xfmr_weights, model_params, next_token, cur_pos - 1,
                                               freqs_cis[cur_pos - 1:cur_pos], kvcache)
         metrics = calculate_metrics(logits, scores)
-        color = metrics.get(color_metric, 0.0)
+
+        if color_metric == "token_probability":
+            probs = torch.softmax(logits[:, -1], dim=-1)
+            token_id = next_token.tolist()[0][0]
+            color = probs[0, token_id].item()
+        else:
+            color = metrics.get(color_metric, 0.0)
+
+        color = normalize_color(color if isinstance(color, float) else color.item(), color_metric)
+        color = round_to_nearest_05(color)
+
         next_token = sample(gen_tokens, logits, scores)
         gen_tokens = torch.cat((gen_tokens, next_token), dim=1)
         decoded_token = tokenizer.decode(next_token.tolist()[0])
-        yield decoded_token, color if isinstance(color, float) else color.item()
+        yield decoded_token, color
         if torch.isin(next_token, stop).any():
             break
 
 
 def process_input(system_prompt, prompt, color_metric):
-    def round_to_nearest_05(value):
-        scaled_value = value * 100
-        rounded_scaled_value = round(scaled_value / 5) * 5
-        return rounded_scaled_value / 100
-
     formatted_prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n{system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
     raw_tokens = tokenizer.encode(formatted_prompt, bos=False, eos=False, allowed_special='all')
 
     output_text = []
-    #colors = []
+    #colors = []  # If tracking colors to test ranges, make sure to comment out normalization and rounding in `generate`.
     for token, color in generate(raw_tokens, color_metric):
     #    colors.append(color)
-        color = max(0.0, min(color, 10.0)) / 10.0
-        color = round_to_nearest_05(color)
         output_text.append((token, color))
+        yield output_text
     #print(f"min: {min(x for x in colors if x != 0)}, max: {max(colors)}")
     yield output_text
 
