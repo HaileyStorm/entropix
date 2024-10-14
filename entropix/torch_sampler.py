@@ -75,7 +75,7 @@ def calculate_metrics(logits: torch.Tensor, attention_scores: torch.Tensor) -> D
 
 def adaptive_sample(logits: torch.Tensor, metrics: Dict[str, torch.Tensor],
                     gen_tokens: torch.Tensor, n_samples: int,
-                    base_temp: float = 0.666, base_top_p: float = 0.90, base_top_k: int = 40, base_min_p: float = 0.03,
+                    base_temp: float = 0.666, base_top_p: float = 0.90, base_top_k: int = 27, base_min_p: float = 0.03,
                     generator: torch.Generator = None) -> torch.Tensor:
     logits_uncertainty = metrics["logits_entropy"] + metrics["logits_varentropy"]
     attn_uncertainty = metrics["attn_entropy"] + metrics["attn_varentropy"]
