@@ -12,11 +12,15 @@ METRIC_RANGES = {
     "logits_entropy": (0.0, 10.0),
     "logits_varentropy": (0.0, 18.0),
     "attn_entropy": (11.1, 12.0),
-    "attn_varentropy": (0.0, 2.0),  # This is always zero for me, so, no idea on a decent range
+    "attn_varentropy": (0.0, 2.0),
     "agreement": (8.9e-07, 4.75e-05),
     "interaction_strength": (0.05, 3.25),
     "token_probability": (1.0e-12, 0.001),
+    "sample_mode": (0.0, 1.0)
 }
+LAST_GENERATION = []
+LAST_GENERATION_METRICS = []
+RENORMALIZE = False
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -70,11 +74,12 @@ def apply_scaling(freqs: torch.Tensor) -> torch.Tensor:
         return scaled
 
     scaled_freqs = torch.vmap(scale_freq)(freqs)
-    
+
     return scaled_freqs
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0, use_scaled: bool = False, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0, use_scaled: bool = False,
+                         dtype: torch.dtype = torch.float32) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=dtype, device=device)[: (dim // 2)] / dim))
     if use_scaled:
         freqs = apply_scaling(freqs)
@@ -86,23 +91,12 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0, use_scaled
 
 
 def build_attn_mask(seqlen: int, start_pos: int) -> torch.Tensor:
-  mask = None
-  if seqlen > 1:
-      mask = torch.full((seqlen, seqlen), float("-inf"))
-      mask = torch.triu(mask, diagonal=1)
-      mask = torch.hstack([torch.zeros((seqlen, start_pos)), mask]).to(torch.float32).to(device)
-  return mask
-
-
-def normalize_color(color, color_metric):
-    min_val, max_val = METRIC_RANGES[color_metric]
-    return max(0.0, min((color - min_val) / (max_val - min_val), 1.0))
-
-
-def round_to_nearest_05(value):
-    scaled_value = value * 100
-    rounded_scaled_value = round(scaled_value / 5) * 5
-    return rounded_scaled_value / 100
+    mask = None
+    if seqlen > 1:
+        mask = torch.full((seqlen, seqlen), float("-inf"))
+        mask = torch.triu(mask, diagonal=1)
+        mask = torch.hstack([torch.zeros((seqlen, start_pos)), mask]).to(torch.float32).to(device)
+    return mask
 
 
 def generate(tokens, color_metric):
@@ -125,49 +119,113 @@ def generate(tokens, color_metric):
 
     # Yield the first token
     first_token = tokenizer.decode(next_token.tolist()[0])
-    yield first_token, 0.0  # Use 0 as the initial color value
+    first_color = 0.0
+    first_metrics = {}
+    yield first_token, first_color, first_metrics
 
-    while cur_pos < 8192:
+    max_tokens = 8192
+    for _ in range(max_tokens):
         cur_pos += 1
-        logits, kvcache, scores, stats = xfmr(xfmr_weights, model_params, next_token, cur_pos - 1,
-                                              freqs_cis[cur_pos - 1:cur_pos], kvcache)
+        try:
+            logits, kvcache, scores, stats = xfmr(xfmr_weights, model_params, next_token, cur_pos - 1,
+                                                  freqs_cis[cur_pos - 1:cur_pos], kvcache)
+        except Exception as e:
+            print(f"Generation error: {e}")
+            break
+
         metrics = calculate_metrics(logits, scores)
+        probs = torch.softmax(logits[:, -1], dim=-1)
+        token_id = next_token.tolist()[0][0]
+        metrics["token_probability"] = probs[0, token_id].item()
+        metrics["sample_mode"] = 0.0  # Adaptive
+        if metrics["logits_entropy"] < 0.1 and metrics["logits_varentropy"] < 0.1:
+            metrics["sample_mode"] = 0.25  # Argmax
+        elif metrics["logits_entropy"] < 5.0 and metrics["logits_varentropy"] > 5.0:  # branch
+            metrics["sample_mode"] = 0.5  # Branch
+        elif metrics["logits_entropy"] > 3.0 and metrics["logits_varentropy"] < 0.1:  # CoT
+            metrics["sample_mode"] = 0.75  # CoT
+        elif metrics["logits_entropy"] > 5.0 and metrics["logits_varentropy"] > 5.0:  # resample
+            metrics["sample_mode"] = 1.0  # Resample
 
-        if color_metric == "token_probability":
-            probs = torch.softmax(logits[:, -1], dim=-1)
-            token_id = next_token.tolist()[0][0]
-            color = probs[0, token_id].item()
-        else:
-            color = metrics.get(color_metric, 0.0)
-
+        color = metrics.get(color_metric, 0.0)
         color = normalize_color(color if isinstance(color, float) else color.item(), color_metric)
         color = round_to_nearest_05(color)
 
         next_token = sample(gen_tokens, logits, scores)
         gen_tokens = torch.cat((gen_tokens, next_token), dim=1)
         decoded_token = tokenizer.decode(next_token.tolist()[0])
-        yield decoded_token, color
+        yield decoded_token, color, metrics
+
         if torch.isin(next_token, stop).any():
             break
 
 
 def process_input(system_prompt, prompt, color_metric):
+    global LAST_GENERATION, LAST_GENERATION_METRICS, RENORMALIZE
+    RENORMALIZE = False
     formatted_prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n{system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
     raw_tokens = tokenizer.encode(formatted_prompt, bos=False, eos=False, allowed_special='all')
 
     output_text = []
-    #colors = []  # If tracking colors to test ranges, make sure to comment out normalization and rounding in `generate`.
-    for token, color in generate(raw_tokens, color_metric):
-    #    colors.append(color)
+    LAST_GENERATION = []
+    LAST_GENERATION_METRICS = []
+    for token, color, metrics in generate(raw_tokens, color_metric):
         output_text.append((token, color))
+        LAST_GENERATION.append(token)
+        LAST_GENERATION_METRICS.append(metrics)
         yield output_text
-    #print(f"min: {min(x for x in colors if x != 0)}, max: {max(colors)}")
     yield output_text
+
+
+def normalize_color(color, color_metric):
+    if RENORMALIZE:
+        colors = [metrics.get(color_metric, 0.0) for metrics in LAST_GENERATION_METRICS]
+        min_val = min(colors)
+        max_val = max(colors)
+        if color_metric == "sample_mode" or min_val == max_val:
+            min_val, max_val = METRIC_RANGES[color_metric]
+    else:
+        min_val, max_val = METRIC_RANGES[color_metric]
+    return float(max(0.0, min((color - min_val) / (max_val - min_val), 1.0)))
+
+
+def round_to_nearest_05(value):
+    scaled_value = value * 100
+    rounded_scaled_value = round(scaled_value / 5) * 5
+    return rounded_scaled_value / 100
+
+
+def color_metric_change(color_metric):
+    if not LAST_GENERATION:
+        return []
+    out = []
+    for token, metrics in zip(LAST_GENERATION, LAST_GENERATION_METRICS):
+        color = metrics.get(color_metric, 0.0)
+        color = normalize_color(color if isinstance(color, float) else color.item(), color_metric)
+        color = round_to_nearest_05(color)
+        out.append((token, color))
+        yield out
+    yield out
+
+
+def renormalize(color_metric):
+    global RENORMALIZE
+    RENORMALIZE = True
+    if not LAST_GENERATION:
+        return []
+    out = []
+    for token, metrics in zip(LAST_GENERATION, LAST_GENERATION_METRICS):
+        color = metrics.get(color_metric, 0.0)
+        color = normalize_color(color if isinstance(color, float) else color.item(), color_metric)
+        color = round_to_nearest_05(color)
+        out.append((token, color))
+        yield out
+    yield out
 
 
 def main():
     color_options = ["logits_entropy", "logits_varentropy", "attn_entropy", "attn_varentropy", "agreement",
-                     "interaction_strength", "token_probability"]
+                     "interaction_strength", "token_probability", "sample_mode"]
 
     with gr.Blocks() as demo:
         gr.Markdown("# Entropix Visualizer")
@@ -175,12 +233,30 @@ def main():
             with gr.Column(scale=1):
                 system_prompt = gr.Textbox(value="You are a helpful assistant.", label="System Prompt")
                 prompt = gr.Textbox(label="Prompt", lines=4)
-                color_metric = gr.Dropdown(choices=color_options, value=color_options[0], label="Color Metric")
+                color_metric_input = gr.Dropdown(choices=color_options, value=color_options[0], label="Color Metric")
                 send_btn = gr.Button("Send")
+                renormalize_btn = gr.Button("Renormalize Colors")
             with gr.Column(scale=3):
-                output_text = gr.HighlightedText(label="Generated Story", combine_adjacent=True, show_legend=False)
+                output_text = gr.HighlightedText(label="Generated Response", combine_adjacent=True, show_legend=False)
 
-        send_btn.click(process_input, inputs=[system_prompt, prompt, color_metric], outputs=output_text)
+        # Send button click handler
+        send_btn.click(
+            process_input,
+            inputs=[system_prompt, prompt, color_metric_input],
+            outputs=[output_text]
+        )
+
+        color_metric_input.change(
+            color_metric_change,
+            inputs=[color_metric_input],
+            outputs=[output_text]
+        )
+
+        renormalize_btn.click(
+            renormalize,
+            inputs=[color_metric_input],
+            outputs=[output_text]
+        )
 
     demo.queue().launch()
 
